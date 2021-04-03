@@ -11,6 +11,9 @@ import multiprocessing
 import json
 import pandas as pd
 from subprocess import call
+from string import punctuation
+
+DEFAULT_SLOTS = ["action", "object", "location"]
 
 class Config:
 	def __init__(self):
@@ -24,7 +27,12 @@ def read_config(config_file):
 	#[experiment]
 	config.seed=int(parser.get("experiment", "seed"))
 	config.folder=parser.get("experiment", "folder")
-	
+
+	if "experiment" in parser and "slots" in parser["experiment"]:
+		config.slots=[x.strip() for x in parser["experiment"]["slots"].split(",")]
+	else:
+		config.slots=DEFAULT_SLOTS
+
 	# Make a folder containing experiment information
 	if not os.path.isdir(config.folder):
 		os.mkdir(config.folder)
@@ -129,16 +137,17 @@ def read_config(config_file):
 
 	return config
 
-def get_SLU_datasets(config):
+
+def get_SLU_datasets(config,data_str,split_style,use_gold_utterances=False,single_label=True, use_all_gold = False, asr_setup = False):
 	"""
 	config: Config object (contains info about model and training)
 	"""
 	base_path = config.slu_path
 
-	# Split
+	# Split - Added support for random split and disjoint split
 	if not config.seq2seq:
 		synthetic_train_df = pd.read_csv(os.path.join(base_path, "data", "synthetic_data.csv"))
-		real_train_df = pd.read_csv(os.path.join(base_path, "data", "train_data.csv"))
+		real_train_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "train_data.csv"))
 		if "\"Unnamed: 0\"" in list(real_train_df): real_train_df = real_train_df.drop(columns="Unnamed: 0")
 	else:
 		synthetic_train_df = pd.read_csv(os.path.join(base_path, "data", "synthetic_data_seq2seq.csv"))
@@ -179,23 +188,32 @@ def get_SLU_datasets(config):
 		#synthetic_train_df = synthetic_train_df.set_index(np.arange(len(synthetic_train_df)))
 
 	train_df = pd.concat([synthetic_train_df, real_train_df]).reset_index()
-	if not config.seq2seq:
-		valid_df = pd.read_csv(os.path.join(base_path, "data", "valid_data.csv"))
-		test_df = pd.read_csv(os.path.join(base_path, "data", "test_data.csv"))
+	if not config.seq2seq: # Read valid and test set - Added support for random split and disjoint split
+		if (split_style=="unseen" or split_style=="challenge"):
+			valid_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "valid_data.csv"))
+			test_unseen_utterance_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "utterance_test_data.csv"))
+			test_unseen_speaker_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "speaker_test_data.csv"))
+		else: 
+			valid_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "valid_data.csv"))
+			test_df = pd.read_csv(os.path.join(base_path, "data/"+data_str, "test_data.csv"))
 	else:
 		valid_df = pd.read_csv(os.path.join(base_path, "data", "valid_data_seq2seq.csv"))
 		test_df = pd.read_csv(os.path.join(base_path, "data", "test_data_seq2seq.csv"))
 
 	if not config.seq2seq:
 		# Get list of slots
-		Sy_intent = {"action": {}, "object": {}, "location": {}}
+		Sy_intent = {}
+		for intent_type in config.slots:
+			Sy_intent[intent_type] = {}
 
 		values_per_slot = []
-		for slot in ["action", "object", "location"]:
+		for slot in config.slots:
 			slot_values = Counter(train_df[slot])
 			for idx,value in enumerate(slot_values):
 				Sy_intent[slot][value] = idx
 			values_per_slot.append(len(slot_values))
+		print(f"Saved slot-name-to-index mapping to intent_mapping.json") # Saved slot-name-to-index mapping
+		json.dump(Sy_intent, open("intent_mapping.json", 'w'))
 		config.values_per_slot = values_per_slot
 		config.Sy_intent = Sy_intent
 	else: #seq2seq
@@ -231,20 +249,49 @@ def get_SLU_datasets(config):
 		config.num_phonemes = len(Sy_phoneme)
 	else:
 		print("No phoneme file found.")
-
+	
+	Sy_word = None
 	# Create dataset objects
-	train_dataset = SLUDataset(train_df, base_path, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
-	valid_dataset = SLUDataset(valid_df, base_path, Sy_intent, config)
-	test_dataset = SLUDataset(test_df, base_path, Sy_intent, config)
-
-	return train_dataset, valid_dataset, test_dataset
+	if use_gold_utterances or asr_setup: # Created support for training intent model on gold utterances
+		Sy_word = []
+		with open(os.path.join(config.folder, "pretraining", "words.txt"), "r") as f:
+			for line in f.readlines():
+				Sy_word.append(line.rstrip("\n"))
+		if not asr_setup:
+			train_dataset = SLU_GoldDataset(train_df, base_path, Sy_word, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+		else:
+			train_dataset = SLUDataset(train_df, base_path, Sy_intent, config, words_out = asr_setup, Sy_word = Sy_word)
+		
+	else:
+		train_dataset = SLUDataset(train_df, base_path, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+	
+	if not use_all_gold or asr_setup:		
+		
+		valid_dataset = SLUDataset(valid_df, base_path, Sy_intent, config, words_out = asr_setup, Sy_word = Sy_word)
+		if (split_style=="unseen" or split_style=="challenge"):
+			test_unseen_utterance_dataset = SLUDataset(test_unseen_utterance_df, base_path, Sy_intent, config, words_out = asr_setup, Sy_word = Sy_word)
+			test_unseen_speaker_dataset = SLUDataset(test_unseen_speaker_df, base_path, Sy_intent, config, words_out = asr_setup, Sy_word = Sy_word)
+		else:
+			test_dataset = SLUDataset(test_df, base_path, Sy_intent, config, words_out = asr_setup, Sy_word = Sy_word)
+	else:
+		
+		valid_dataset = SLU_GoldDataset(valid_df, base_path, Sy_word, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+		if (split_style=="unseen" or split_style=="challenge"):
+			test_unseen_utterance_dataset = SLU_GoldDataset(test_unseen_utterance_df, base_path, Sy_word, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+			test_unseen_speaker_dataset = SLU_GoldDataset(test_unseen_speaker_df, base_path, Sy_word, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+		else:
+			test_dataset = SLU_GoldDataset(test_df, base_path, Sy_word, Sy_intent, config,upsample_factor=config.dataset_upsample_factor)
+	if (split_style=="unseen" or split_style=="challenge"):
+		return train_dataset, valid_dataset, test_unseen_utterance_dataset, test_unseen_speaker_dataset
+	else:
+		return train_dataset, valid_dataset, test_dataset
 
 # taken from https://github.com/jfsantos/maracas/blob/master/maracas/maracas.py
 def rms_energy(x):
 	return 10*np.log10((1e-12 + x.dot(x))/len(x))
 
 class SLUDataset(torch.utils.data.Dataset):
-	def __init__(self, df, base_path, Sy_intent, config, upsample_factor=1):
+	def __init__(self, df, base_path, Sy_intent, config, upsample_factor=1, words_out = False, Sy_word = None):
 		"""
 		df:
 		Sy_intent: Dictionary (transcript --> slot values)
@@ -257,8 +304,14 @@ class SLUDataset(torch.utils.data.Dataset):
 		self.augment = False #augment
 		self.SNRs = [0,5,10,15,20]
 		self.seq2seq = config.seq2seq
+		self.config = config
 
-		self.loader = torch.utils.data.DataLoader(self, batch_size=config.training_batch_size, num_workers=multiprocessing.cpu_count(), shuffle=True, collate_fn=CollateWavsSLU(self.Sy_intent, self.seq2seq))
+		self.words_out = words_out
+		if self.words_out:
+			assert Sy_word is not None
+		self.Sy_word = Sy_word
+
+		self.loader = torch.utils.data.DataLoader(self, batch_size=config.training_batch_size, num_workers=multiprocessing.cpu_count(), shuffle=True, collate_fn=CollateWavsSLU(self.Sy_intent, self.seq2seq, pad_all=words_out))
 
 	def __len__(self):
 		#if self.augment: return len(self.df)*2 # second half of dataset is augmented
@@ -272,6 +325,9 @@ class SLUDataset(torch.utils.data.Dataset):
 		wav_path = os.path.join(self.base_path, self.df.loc[idx].path)
 		effect = torchaudio.sox_effects.SoxEffectsChain()
 		effect.set_input_file(wav_path)
+		if self.words_out:
+			x_utterance = self.df.loc[idx].transcription.split(" ")
+			y_words=[self.Sy_word.index(k.lower().strip(punctuation)) if k.lower().strip(punctuation) in self.Sy_word else self.config.vocabulary_size for k in x_utterance]
 
 		augment = False
 		if augment:
@@ -317,7 +373,59 @@ class SLUDataset(torch.utils.data.Dataset):
 
 		if not self.seq2seq:
 			y_intent = [] 
-			for slot in ["action", "object", "location"]:
+			if not self.words_out:
+				for slot in self.config.slots:
+					value = self.df.loc[idx][slot]
+					y_intent.append(self.Sy_intent[slot][value])
+			else:
+				y_intent = y_words
+
+		else:
+			# need sos, eos
+			y_intent = [self.Sy_intent.index("<sos>")]
+			y_intent += [self.Sy_intent.index(c) for c in self.df.loc[idx]["semantics"]]
+			y_intent.append(self.Sy_intent.index("<eos>"))
+		return (x, self.df.loc[idx].path, y_intent)
+
+# Class to load data used to train intent model on gold set utterances
+class SLU_GoldDataset(torch.utils.data.Dataset):
+	def __init__(self, df, base_path, Sy_word, Sy_intent, config, upsample_factor=1, collate = 'wavs'):
+		"""
+		df:
+		Sy_intent: Dictionary (transcript --> slot values)
+		config: Config object (contains info about model and training)
+		Sy_word: List of words in vocabulary
+		"""
+		self.df = df
+		self.base_path = base_path
+		self.Sy_intent = Sy_intent
+		self.Sy_word = Sy_word
+
+		self.upsample_factor = upsample_factor
+		self.augment = False #augment
+		self.SNRs = [0,5,10,15,20]
+		self.seq2seq = config.seq2seq
+		self.config_vocab_size = config.vocabulary_size
+		self.loader = torch.utils.data.DataLoader(self, batch_size=config.training_batch_size, num_workers=multiprocessing.cpu_count(), shuffle=True, collate_fn=CollateWavsSLU(self.Sy_intent, self.seq2seq))
+		self.config = config
+	def __len__(self):
+		#if self.augment: return len(self.df)*2 # second half of dataset is augmented
+		return len(self.df) * self.upsample_factor
+
+	def __getitem__(self, idx):
+		#augment = ((idx / len(self.df)) > 1) and self.augment
+		#true_idx = idx
+		idx = idx % len(self.df)
+
+		wav_path = os.path.join(self.base_path, self.df.loc[idx].path)
+		effect = torchaudio.sox_effects.SoxEffectsChain()
+		effect.set_input_file(wav_path)
+		x_utterance = self.df.loc[idx].transcription.split(" ")
+		x=[self.Sy_word.index(k.lower().strip(punctuation)) if k.lower().strip(punctuation) in self.Sy_word else self.config_vocab_size for k in x_utterance]
+
+		if not self.seq2seq:
+			y_intent = [] 
+			for slot in self.config.slots:
 				value = self.df.loc[idx][slot]
 				y_intent.append(self.Sy_intent[slot][value])
 		else:
@@ -325,8 +433,7 @@ class SLUDataset(torch.utils.data.Dataset):
 			y_intent = [self.Sy_intent.index("<sos>")]
 			y_intent += [self.Sy_intent.index(c) for c in self.df.loc[idx]["semantics"]]
 			y_intent.append(self.Sy_intent.index("<eos>"))
-
-		return (x, y_intent)
+		return (x, self.df.loc[idx].path, y_intent)
 
 def one_hot(letters, S):
 	"""
@@ -342,10 +449,11 @@ def one_hot(letters, S):
 	return out
 
 class CollateWavsSLU:
-	def __init__(self, Sy_intent, seq2seq):
+	def __init__(self, Sy_intent, seq2seq, pad_all = False):
 		self.Sy_intent = Sy_intent
 		self.num_labels = len(self.Sy_intent)
 		self.seq2seq = seq2seq
+		self.pad_all = pad_all
 		if self.seq2seq:
 			self.EOS = self.Sy_intent.index("<eos>")
 
@@ -355,25 +463,41 @@ class CollateWavsSLU:
 
 		Returns a minibatch of wavs and labels as Tensors.
 		"""
-		x = []; y_intent = []
+		x = []; x_paths=[]; y_intent = []
 		batch_size = len(batch)
+		
 		for index in range(batch_size):
-			x_,y_intent_ = batch[index]
+			
+			x_, x_path, y_intent_ = batch[index]
 
 			x.append(torch.tensor(x_).float())
 			y_intent.append(torch.tensor(y_intent_).long())
-
+			x_paths.append(x_path)
+		
 		# pad all sequences to have same length
 		if not self.seq2seq:
-			T = max([len(x_) for x_ in x])
-			for index in range(batch_size):
-				x_pad_length = (T - len(x[index]))
-				x[index] = torch.nn.functional.pad(x[index], (0,x_pad_length))
+			to_pad = {'x' : x}
+			padded = {}
+			if self.pad_all:
+				to_pad['y']= y_intent
+			else:
+				padded['y']=y_intent
+			
+			for val_name, val in to_pad.items():
+				T = max([len(x_) for x_ in val])
+			
+
+				for index in range(batch_size):
+					x_pad_length = (T - len(val[index]))
+					val[index] = torch.nn.functional.pad(val[index], (0,x_pad_length))
+					padded[val_name] = val
+			x = padded['x']
+			y_intent = padded['y']
 
 			x = torch.stack(x)
 			y_intent = torch.stack(y_intent)
 
-			return (x,y_intent)
+			return (x,x_paths,y_intent)
 
 		else: # seq2seq
 			T = max([len(x_) for x_ in x])
@@ -388,7 +512,61 @@ class CollateWavsSLU:
 			y_intent = torch.stack(y_intent)
 			y_intent = one_hot(y_intent, self.num_labels)
 
-			return (x,y_intent)
+			return (x,x_paths,y_intent) # Added support for returning audio paths
+
+
+# class CollateTranscriptSLU:
+# 	def __init__(self, Sy_intent, seq2seq):
+# 		self.Sy_intent = Sy_intent
+# 		self.num_labels = len(self.Sy_intent)
+# 		self.seq2seq = seq2seq
+# 		if self.seq2seq:
+# 			self.EOS = self.Sy_intent.index("<eos>")
+
+# 	def __call__(self, batch):
+# 		"""
+# 		batch: list of tuples (input wav, intent labels)
+
+# 		Returns a minibatch of wavs and labels as Tensors.
+# 		"""
+# 		x = []; x_paths=[]; y_intent = []
+# 		batch_size = len(batch)
+		
+# 		for index in range(batch_size):
+			
+# 			x_, x_path, y_intent_ = batch[index]
+# 			print(x_)
+
+# 			x.append(torch.tensor(x_).float())
+# 			y_intent.append(torch.tensor(y_intent_).long())
+# 			x_paths.append(x_path)
+		
+# 		# pad all sequences to have same length
+# 		if not self.seq2seq:
+# 			T = max([len(x_) for x_ in x])
+# 			for index in range(batch_size):
+# 				x_pad_length = (T - len(x[index]))
+# 				x[index] = torch.nn.functional.pad(x[index], (0,x_pad_length))
+
+# 			x = torch.stack(x)
+# 			y_intent = torch.stack(y_intent)
+
+# 			return (x,x_paths,y_intent)
+
+# 		else: # seq2seq
+# 			T = max([len(x_) for x_ in x])
+# 			U = max([len(y_intent_) for y_intent_ in y_intent])
+# 			for index in range(batch_size):
+# 				x_pad_length = (T - len(x[index]))
+# 				x[index] = torch.nn.functional.pad(x[index], (0,x_pad_length))
+# 				y_pad_length = (U - len(y_intent[index]))
+# 				y_intent[index] = torch.nn.functional.pad(y_intent[index], (0,y_pad_length), value=self.EOS)
+
+# 			x = torch.stack(x)
+# 			y_intent = torch.stack(y_intent)
+# 			y_intent = one_hot(y_intent, self.num_labels)
+
+# 			return (x,x_paths,y_intent) # Added support for returning audio paths
 
 def get_ASR_datasets(config):
 	"""
